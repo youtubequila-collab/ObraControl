@@ -1,0 +1,479 @@
+rules_version = '2';
+
+// ===============================================================
+// ObraControl — Firestore Security Rules (Prototype)
+// ===============================================================
+//
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: Firebase Auth UID
+// Fields:
+//   - email: string (required, immutable) — user email
+//   - nombre: string (required, max 100) — full name
+//   - rol: string (required) — one of 'admin','maestro','ingeniero','almacenero'
+//   - obrasAsignadas: list (required, max 50) — obra IDs the user can access
+//   - activo: bool (required) — whether account is active
+//   - fechaCreacion: timestamp (required, immutable)
+//   - ultimoAcceso: timestamp (optional)
+//
+// Collection: obras
+// Document ID: auto-generated
+// Fields:
+//   - codigo: string (required, max 30, immutable)
+//   - nombre: string (required, max 200)
+//   - ubicacion: string (required, max 300)
+//   - cliente: string (required, max 200)
+//   - fechaInicio: timestamp (required)
+//   - fechaFinPrevista: timestamp (required)
+//   - ingenieroId: string (required, max 128) — UID of assigned engineer
+//   - estado: string (required) — 'activa','pausada','finalizada','cancelada'
+//   - fechaCreacion: timestamp (required, immutable)
+//   - creadoPor: string (required, max 128, immutable)
+//
+// Collection: materiales
+// Document ID: auto-generated
+// Fields:
+//   - codigo: string (required, max 30, immutable)
+//   - nombre: string (required, max 200)
+//   - categoria: string (required, max 100)
+//   - descripcion: string (optional, max 500)
+//   - unidadMedida: string (required, max 30)
+//   - stockMinimo: number (required, >= 0)
+//   - precioReferencial: number (optional, >= 0)
+//   - activo: bool (required)
+//   - fechaCreacion: timestamp (required, immutable)
+//
+// Collection: almacenes
+// Document ID: auto-generated
+// Fields:
+//   - nombre: string (required, max 200)
+//   - ubicacion: string (required, max 300)
+//   - responsableId: string (required, max 128)
+//   - activo: bool (required)
+//   - fechaCreacion: timestamp (required, immutable)
+//
+// Collection: inventario
+// Document ID: auto-generated
+// Fields:
+//   - almacenId: string (required, max 128)
+//   - materialId: string (required, max 128)
+//   - stockActual: number (required, >= 0)
+//   - ultimaActualizacion: timestamp (required)
+//
+// Collection: solicitudes
+// Document ID: auto-generated
+// Fields:
+//   - codigo: string (required, max 30)
+//   - obraId: string (required, max 128, immutable)
+//   - solicitanteId: string (required, max 128, immutable)
+//   - solicitanteNombre: string (required, max 100)
+//   - area: string (required, max 200)
+//   - fechaRequerida: timestamp (required)
+//   - prioridad: string (required) — 'baja','media','alta','urgente'
+//   - justificacion: string (required, max 1000)
+//   - estado: string (required) — workflow states
+//   - observaciones: string (optional, max 2000)
+//   - items: list (required, max 50)
+//   - fechaCreacion: timestamp (required, immutable)
+//   - fechaActualizacion: timestamp (required)
+//   - aprobadoPor: string (optional, max 128)
+//   - fechaAprobacion: timestamp (optional)
+//
+// Collection: aprobaciones
+// Document ID: auto-generated
+// Fields:
+//   - solicitudId: string (required, max 128, immutable)
+//   - aprobadorId: string (required, max 128, immutable)
+//   - accion: string (required) — 'aprobada','rechazada','devuelta','aprobada_parcial'
+//   - observacion: string (optional, max 2000)
+//   - itemsModificados: list (optional, max 50)
+//   - fecha: timestamp (required, immutable)
+//
+// Collection: movimientos_inventario
+// Document ID: auto-generated
+// Fields: (created by Cloud Functions only)
+//   - almacenId, materialId, tipo, cantidad, solicitudId, valeId,
+//     realizadoPor, fecha, observacion
+//
+// Collection: vales
+// Document ID: auto-generated
+// Fields: (created by Cloud Functions only)
+//   - codigo, solicitudId, obraId, solicitanteId, aprobadorId,
+//     almaceneroId, items, fechaEmision, observaciones
+//
+// Collection: notificaciones
+// Document ID: auto-generated
+// Fields:
+//   - destinatarioId: string (required, max 128, immutable)
+//   - tipo: string (required, max 50)
+//   - titulo: string (required, max 200)
+//   - mensaje: string (required, max 500)
+//   - leida: bool (required)
+//   - referencia: string (optional, max 200)
+//   - fecha: timestamp (required, immutable)
+//
+// Collection: auditoria
+// Document ID: auto-generated
+// Fields: (created by Cloud Functions only — read-only for clients)
+//   - accion, entidad, entidadId, usuarioId, detalles, fecha
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================
+    // DEFAULT DENY — no access unless explicitly granted
+    // =========================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================
+    // Helper Functions
+    // =========================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.rol;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && getUserRole() == 'admin';
+    }
+
+    function isMaestro() {
+      return isAuthenticated() && getUserRole() == 'maestro';
+    }
+
+    function isIngeniero() {
+      return isAuthenticated() && getUserRole() == 'ingeniero';
+    }
+
+    function isAlmacenero() {
+      return isAuthenticated() && getUserRole() == 'almacenero';
+    }
+
+    function isActive() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.activo == true;
+    }
+
+    function isAuthenticatedAndActive() {
+      return isAuthenticated() && isActive();
+    }
+
+    function hasObraAccess(obraId) {
+      return obraId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.obrasAsignadas;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    function isValidOptionalString(field, maxLen) {
+      return !(field in request.resource.data) ||
+             request.resource.data[field] == '' ||
+             (request.resource.data[field] is string &&
+              request.resource.data[field].size() <= maxLen);
+    }
+
+    // =========================================================
+    // USERS — Only admin can create/update users
+    // =========================================================
+    match /users/{userId} {
+      // Users can read their own profile; admins can read any
+      allow read: if isAuthenticated() &&
+                     (request.auth.uid == userId || isAdmin());
+
+      // Only admin creates user profiles (via Cloud Function preferred)
+      allow create: if isAdmin() &&
+                       isValidUserDoc(request.resource.data) &&
+                       request.resource.data.rol in ['admin','maestro','ingeniero','almacenero'];
+
+      // Only admin can update; role can only be set by admin
+      // Users CANNOT change their own role
+      allow update: if isAdmin() &&
+                       isValidUserDoc(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['email', 'fechaCreacion']) &&
+                       request.resource.data.rol in ['admin','maestro','ingeniero','almacenero'];
+
+      allow delete: if false; // Never delete, only deactivate
+
+      function isValidUserDoc(data) {
+        return hasRequiredFields(['email','nombre','rol','obrasAsignadas','activo','fechaCreacion']) &&
+               hasOnlyAllowedFields(['email','nombre','rol','obrasAsignadas','activo','fechaCreacion','ultimoAcceso']) &&
+               data.email is string && data.email.size() > 0 && data.email.size() <= 254 &&
+               data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 100 &&
+               data.rol is string && data.rol.size() <= 20 &&
+               data.obrasAsignadas is list && data.obrasAsignadas.size() <= 50 &&
+               data.activo is bool &&
+               data.fechaCreacion is timestamp;
+      }
+    }
+
+    // =========================================================
+    // OBRAS — Admin manages; assigned users can read
+    // =========================================================
+    match /obras/{obraId} {
+      allow read: if isAuthenticatedAndActive() &&
+                     (isAdmin() || hasObraAccess(obraId));
+
+      allow create: if isAdmin() &&
+                       isValidObra(request.resource.data);
+
+      allow update: if isAdmin() &&
+                       isValidObra(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['codigo', 'fechaCreacion', 'creadoPor']);
+
+      allow delete: if false;
+
+      function isValidObra(data) {
+        return hasRequiredFields(['codigo','nombre','ubicacion','cliente','fechaInicio','fechaFinPrevista','ingenieroId','estado','fechaCreacion','creadoPor']) &&
+               hasOnlyAllowedFields(['codigo','nombre','ubicacion','cliente','fechaInicio','fechaFinPrevista','ingenieroId','estado','fechaCreacion','creadoPor']) &&
+               data.codigo is string && data.codigo.size() > 0 && data.codigo.size() <= 30 &&
+               data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 200 &&
+               data.ubicacion is string && data.ubicacion.size() > 0 && data.ubicacion.size() <= 300 &&
+               data.cliente is string && data.cliente.size() > 0 && data.cliente.size() <= 200 &&
+               data.fechaInicio is timestamp &&
+               data.fechaFinPrevista is timestamp &&
+               data.ingenieroId is string && data.ingenieroId.size() > 0 && data.ingenieroId.size() <= 128 &&
+               data.estado is string && data.estado in ['activa','pausada','finalizada','cancelada'] &&
+               data.fechaCreacion is timestamp &&
+               data.creadoPor is string && data.creadoPor.size() <= 128;
+      }
+    }
+
+    // =========================================================
+    // MATERIALES — Admin manages; authenticated active users read
+    // =========================================================
+    match /materiales/{materialId} {
+      allow read: if isAuthenticatedAndActive();
+
+      allow create: if isAdmin() &&
+                       isValidMaterial(request.resource.data);
+
+      allow update: if isAdmin() &&
+                       isValidMaterial(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['codigo', 'fechaCreacion']);
+
+      allow delete: if false;
+
+      function isValidMaterial(data) {
+        return hasRequiredFields(['codigo','nombre','categoria','unidadMedida','stockMinimo','activo','fechaCreacion']) &&
+               hasOnlyAllowedFields(['codigo','nombre','categoria','descripcion','unidadMedida','stockMinimo','precioReferencial','activo','fechaCreacion']) &&
+               data.codigo is string && data.codigo.size() > 0 && data.codigo.size() <= 30 &&
+               data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 200 &&
+               data.categoria is string && data.categoria.size() > 0 && data.categoria.size() <= 100 &&
+               data.unidadMedida is string && data.unidadMedida.size() > 0 && data.unidadMedida.size() <= 30 &&
+               data.stockMinimo is number && data.stockMinimo >= 0 &&
+               data.activo is bool &&
+               data.fechaCreacion is timestamp;
+      }
+    }
+
+    // =========================================================
+    // ALMACENES — Admin manages; authenticated active users read
+    // =========================================================
+    match /almacenes/{almacenId} {
+      allow read: if isAuthenticatedAndActive();
+
+      allow create: if isAdmin() &&
+                       isValidAlmacen(request.resource.data);
+
+      allow update: if isAdmin() &&
+                       isValidAlmacen(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['fechaCreacion']);
+
+      allow delete: if false;
+
+      function isValidAlmacen(data) {
+        return hasRequiredFields(['nombre','ubicacion','responsableId','activo','fechaCreacion']) &&
+               hasOnlyAllowedFields(['nombre','ubicacion','responsableId','activo','fechaCreacion']) &&
+               data.nombre is string && data.nombre.size() > 0 && data.nombre.size() <= 200 &&
+               data.ubicacion is string && data.ubicacion.size() > 0 && data.ubicacion.size() <= 300 &&
+               data.responsableId is string && data.responsableId.size() > 0 && data.responsableId.size() <= 128 &&
+               data.activo is bool &&
+               data.fechaCreacion is timestamp;
+      }
+    }
+
+    // =========================================================
+    // INVENTARIO — Read by active users; writes via Cloud Functions only
+    // =========================================================
+    match /inventario/{invId} {
+      allow read: if isAuthenticatedAndActive();
+      allow write: if false; // Only Cloud Functions (Admin SDK) modify inventory
+    }
+
+    // =========================================================
+    // SOLICITUDES — Complex workflow, role-based access
+    // =========================================================
+    match /solicitudes/{solicitudId} {
+      // Read: admin sees all; others only their assigned obras
+      allow read: if isAuthenticatedAndActive() &&
+                     (isAdmin() ||
+                      (resource != null && hasObraAccess(resource.data.obraId)));
+
+      // Maestro creates solicitudes for obras they are assigned to
+      allow create: if isAuthenticatedAndActive() &&
+                       isMaestro() &&
+                       isValidSolicitudCreate(request.resource.data) &&
+                       request.resource.data.solicitanteId == request.auth.uid &&
+                       hasObraAccess(request.resource.data.obraId) &&
+                       request.resource.data.estado in ['borrador', 'pendiente'];
+
+      // Updates depend on role and current state
+      allow update: if isAuthenticatedAndActive() &&
+                       isValidSolicitudUpdate(request.resource.data) &&
+                       areImmutableFieldsUnchanged(['codigo','obraId','solicitanteId','fechaCreacion']) &&
+                       validSolicitudTransition();
+
+      allow delete: if false;
+
+      function isValidSolicitudCreate(data) {
+        return hasRequiredFields(['codigo','obraId','solicitanteId','solicitanteNombre','area','fechaRequerida','prioridad','justificacion','estado','items','fechaCreacion','fechaActualizacion']) &&
+               hasOnlyAllowedFields(['codigo','obraId','solicitanteId','solicitanteNombre','area','fechaRequerida','prioridad','justificacion','estado','items','fechaCreacion','fechaActualizacion','observaciones','aprobadoPor','fechaAprobacion']) &&
+               data.codigo is string && data.codigo.size() > 0 && data.codigo.size() <= 30 &&
+               data.obraId is string && data.obraId.size() > 0 && data.obraId.size() <= 128 &&
+               data.solicitanteId is string && data.solicitanteId.size() > 0 && data.solicitanteId.size() <= 128 &&
+               data.solicitanteNombre is string && data.solicitanteNombre.size() > 0 && data.solicitanteNombre.size() <= 100 &&
+               data.area is string && data.area.size() > 0 && data.area.size() <= 200 &&
+               data.fechaRequerida is timestamp &&
+               data.prioridad is string && data.prioridad in ['baja','media','alta','urgente'] &&
+               data.justificacion is string && data.justificacion.size() > 0 && data.justificacion.size() <= 1000 &&
+               data.estado is string &&
+               data.items is list && data.items.size() > 0 && data.items.size() <= 50 &&
+               data.fechaCreacion is timestamp &&
+               data.fechaActualizacion is timestamp;
+      }
+
+      function isValidSolicitudUpdate(data) {
+        return hasRequiredFields(['codigo','obraId','solicitanteId','solicitanteNombre','area','fechaRequerida','prioridad','justificacion','estado','items','fechaCreacion','fechaActualizacion']) &&
+               hasOnlyAllowedFields(['codigo','obraId','solicitanteId','solicitanteNombre','area','fechaRequerida','prioridad','justificacion','estado','items','fechaCreacion','fechaActualizacion','observaciones','aprobadoPor','fechaAprobacion']) &&
+               data.codigo is string && data.codigo.size() <= 30 &&
+               data.solicitanteNombre is string && data.solicitanteNombre.size() <= 100 &&
+               data.area is string && data.area.size() <= 200 &&
+               data.justificacion is string && data.justificacion.size() <= 1000 &&
+               data.items is list && data.items.size() > 0 && data.items.size() <= 50 &&
+               data.fechaActualizacion is timestamp;
+      }
+
+      function validSolicitudTransition() {
+        let oldState = resource.data.estado;
+        let newState = request.resource.data.estado;
+        let role = getUserRole();
+
+        // Maestro: borrador -> pendiente, devuelta -> pendiente, or edit borrador
+        // Ingeniero: pendiente -> aprobada|rechazada|devuelta|aprobada_parcial
+        // Almacenero transitions handled via Cloud Functions
+        // Admin can cancel
+
+        return (role == 'maestro' && request.auth.uid == resource.data.solicitanteId && (
+                  (oldState == 'borrador' && newState in ['borrador', 'pendiente']) ||
+                  (oldState == 'devuelta' && newState in ['pendiente', 'cancelada'])
+               )) ||
+               (role == 'ingeniero' && hasObraAccess(resource.data.obraId) && (
+                  (oldState == 'pendiente' && newState in ['aprobada', 'rechazada', 'devuelta', 'aprobada_parcial'])
+               )) ||
+               (role == 'admin' && (
+                  newState == 'cancelada' || newState == oldState
+               ));
+      }
+    }
+
+    // =========================================================
+    // APROBACIONES — Ingeniero creates; read by obra-assigned users
+    // =========================================================
+    match /aprobaciones/{aprobacionId} {
+      allow read: if isAuthenticatedAndActive() &&
+                     (isAdmin() || isIngeniero() || isMaestro());
+
+      // Only ingeniero creates approval records (also validated in Cloud Function)
+      allow create: if isAuthenticatedAndActive() &&
+                       isIngeniero() &&
+                       isValidAprobacion(request.resource.data) &&
+                       request.resource.data.aprobadorId == request.auth.uid;
+
+      allow update: if false; // Immutable audit records
+      allow delete: if false;
+
+      function isValidAprobacion(data) {
+        return hasRequiredFields(['solicitudId','aprobadorId','accion','fecha']) &&
+               hasOnlyAllowedFields(['solicitudId','aprobadorId','accion','observacion','itemsModificados','fecha']) &&
+               data.solicitudId is string && data.solicitudId.size() > 0 && data.solicitudId.size() <= 128 &&
+               data.aprobadorId is string && data.aprobadorId.size() > 0 && data.aprobadorId.size() <= 128 &&
+               data.accion is string && data.accion in ['aprobada','rechazada','devuelta','aprobada_parcial'] &&
+               data.fecha is timestamp;
+      }
+    }
+
+    // =========================================================
+    // MOVIMIENTOS_INVENTARIO — Created by Cloud Functions only
+    // =========================================================
+    match /movimientos_inventario/{movId} {
+      allow read: if isAuthenticatedAndActive() &&
+                     (isAdmin() || isAlmacenero());
+      allow write: if false; // Only Cloud Functions create movements
+    }
+
+    // =========================================================
+    // VALES — Created by Cloud Functions only
+    // =========================================================
+    match /vales/{valeId} {
+      allow read: if isAuthenticatedAndActive();
+      allow write: if false; // Only Cloud Functions create vales
+    }
+
+    // =========================================================
+    // NOTIFICACIONES — User reads/updates own; Cloud Functions create
+    // =========================================================
+    match /notificaciones/{notifId} {
+      allow read: if isAuthenticated() &&
+                     resource.data.destinatarioId == request.auth.uid;
+
+      // Users can mark their own notifications as read
+      allow update: if isAuthenticated() &&
+                       resource.data.destinatarioId == request.auth.uid &&
+                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['leida']) &&
+                       request.resource.data.leida is bool;
+
+      allow create: if false; // Only Cloud Functions
+      allow delete: if false;
+    }
+
+    // =========================================================
+    // AUDITORIA — Read only by admin; written by Cloud Functions
+    // =========================================================
+    match /auditoria/{auditId} {
+      allow read: if isAdmin();
+      allow write: if false; // Only Cloud Functions
+    }
+
+    // =========================================================
+    // CONTADORES — Used for sequential codes; Cloud Functions only
+    // =========================================================
+    match /contadores/{contadorId} {
+      allow read: if isAuthenticatedAndActive();
+      allow write: if false; // Only Cloud Functions
+    }
+  }
+}
